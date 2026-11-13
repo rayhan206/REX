@@ -11,8 +11,9 @@ from pydantic import Field, model_validator
 from .types import Limits, Record
 from .util import fingerprint
 
-CORE = ["resample", "greedy", "rex", "rex_progress", "rex_cost", "rex_progress_cost", "budgeted_rex"]
-METHODS = CORE + ["bfs", "fixed_width"]
+CORE = ["resample", "greedy", "rex", "rex_progress", "rex_cost", "rex_progress_cost"]
+EXTENSIONS = ["budgeted_rex"]
+METHODS = CORE + EXTENSIONS + ["bfs", "fixed_width"]
 
 
 class Experiment(Record):

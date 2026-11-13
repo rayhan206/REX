@@ -456,7 +456,9 @@ class TestCounterfactualBaselineChoice:
 
 class TestConfigNewFields:
     def test_budgeted_rex_in_methods(self):
+        from rexbench.config import METHODS, EXTENSIONS
         assert "budgeted_rex" in METHODS
+        assert "budgeted_rex" in EXTENSIONS
 
     def test_policy_defaults(self):
         cfg = Policy()
