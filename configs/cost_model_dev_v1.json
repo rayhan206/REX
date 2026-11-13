@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "description": "Frozen linear cost model fitted on development-only pilot traces. Coefficients estimated via OLS on 149 requests (131 GPU + 18 CPU campaigns). Freeze these values before any held-out evaluation run.",
+  "root_intercept": 480.0,
+  "repair_intercept": 620.0,
+  "prompt_char_coef": 0.26,
+  "candidate_char_coef": 0.11,
+  "depth_coef": 18.0,
+  "error_feedback_coef": 0.14,
+  "output_reserve": 280.0,
+  "fit_mae_tokens": 179.47,
+  "fit_mape_pct": 29.68,
+  "fit_source": "development_pilot_gpu_cpu_combined",
+  "fit_n_requests": 149
+}
