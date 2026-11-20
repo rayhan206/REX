@@ -13,9 +13,9 @@ The report computes:
   budgeted_rex chose a different arm than baseline rex would have.
 - Cost Intervention Rate: decisions changed by the cost term alone.
 - Progress Intervention Rate: decisions changed by the progress term alone.
-- Estimator calibration: MAE, MAPE, within-decision rank correlation.
+- Estimator calibration: MAE, MAPE, and request-level rank correlation.
 - Branch diagnostics: duplicate rate, invalid rate, root share, mean depth.
-- Budget utilisation: fraction of trials that hit the token cap, mean overshoot.
+- Trial stop-reason counts, including token-budget exhaustion.
 
 The report is written as JSON and also printed as a human-readable summary.
 """
@@ -36,13 +36,9 @@ def _load_events(db_path: Path) -> list[dict]:
     events = []
     try:
         for row in con.execute(
-            "SELECT e.payload_blob FROM events e WHERE e.type='step_committed'"
+            "SELECT payload FROM events WHERE kind='step_committed' ORDER BY number"
         ):
-            payload_blob = con.execute(
-                "SELECT value FROM blobs WHERE id=?", (row["payload_blob"],)
-            ).fetchone()
-            if payload_blob:
-                events.append(json.loads(payload_blob["value"]))
+            events.append(json.loads(row["payload"]))
     finally:
         con.close()
     return events
@@ -53,6 +49,8 @@ def _compute_pir(events: list[dict]) -> dict[str, Any]:
     pir_count = 0
     cost_changed = 0
     progress_changed = 0
+    component_total = 0
+    budget_filter_decisions = 0
 
     for ev in events:
         mech = ev.get("mechanism", {})
@@ -65,31 +63,76 @@ def _compute_pir(events: list[dict]) -> dict[str, Any]:
         changed = mech.get("policy_changed_choice", False)
         if changed:
             pir_count += 1
+        if "cost_changed_choice" in mech and "progress_changed_choice" in mech:
+            component_total += 1
+            cost_changed += int(mech["cost_changed_choice"])
+            progress_changed += int(mech["progress_changed_choice"])
+        budget_filter_decisions += int(mech.get("budget_filtered_count", 0) > 0)
 
     return {
         "nontrivial_decisions": total,
         "pir_count": pir_count,
         "pir": pir_count / total if total else None,
+        "component_diagnostic_decisions": component_total,
+        "cost_intervention_count": cost_changed,
+        "cost_intervention_rate": cost_changed / component_total if component_total else None,
+        "progress_intervention_count": progress_changed,
+        "progress_intervention_rate": progress_changed / component_total if component_total else None,
+        "budget_filter_decisions": budget_filter_decisions,
+        "budget_filter_rate": budget_filter_decisions / total if total else None,
     }
 
 
 def _calibration(events: list[dict]) -> dict[str, Any]:
-    errors = []
+    pairs = []
     for ev in events:
         estimated = ev.get("estimated_tokens")
         actual = ev.get("actual_tokens")
         if estimated is not None and actual is not None:
-            errors.append(actual - estimated)
-    if not errors:
+            pairs.append((float(estimated), float(actual)))
+    if not pairs:
         return {}
     import statistics
+    errors = [actual - estimated for estimated, actual in pairs]
     abs_errors = [abs(e) for e in errors]
+    mapes = [abs(error) / max(1.0, actual) for error, (_, actual) in zip(errors, pairs)]
+
+    def ranks(values: list[float]) -> list[float]:
+        order = sorted(range(len(values)), key=values.__getitem__)
+        result = [0.0] * len(values)
+        cursor = 0
+        while cursor < len(order):
+            end = cursor + 1
+            while end < len(order) and values[order[end]] == values[order[cursor]]:
+                end += 1
+            rank = (cursor + end - 1) / 2.0
+            for index in order[cursor:end]:
+                result[index] = rank
+            cursor = end
+        return result
+
+    def correlation(left: list[float], right: list[float]) -> float | None:
+        if len(left) < 2:
+            return None
+        left_mean, right_mean = statistics.mean(left), statistics.mean(right)
+        numerator = sum((a - left_mean) * (b - right_mean) for a, b in zip(left, right))
+        denominator = (
+            sum((a - left_mean) ** 2 for a in left)
+            * sum((b - right_mean) ** 2 for b in right)
+        ) ** 0.5
+        return numerator / denominator if denominator else None
+
     return {
         "n": len(errors),
         "mae": sum(abs_errors) / len(abs_errors),
+        "mape_pct": 100.0 * sum(mapes) / len(mapes),
         "median_abs_error": statistics.median(abs_errors),
         "mean_error": sum(errors) / len(errors),
         "underprediction_rate": sum(1 for e in errors if e > 0) / len(errors),
+        "request_rank_correlation": correlation(
+            ranks([estimated for estimated, _ in pairs]),
+            ranks([actual for _, actual in pairs]),
+        ),
     }
 
 
@@ -98,7 +141,7 @@ def _branch_stats(events: list[dict]) -> dict[str, Any]:
     if not total:
         return {}
     duplicates = sum(1 for ev in events if ev.get("duplicate", False))
-    invalids = sum(1 for ev in events if ev.get("parse_status") not in ("ok", None))
+    invalids = sum(1 for ev in events if ev.get("parse_status") == "INVALID_COMPLETION")
     root_expansions = sum(1 for ev in events if ev.get("parent_id") == "root")
     depths = [ev.get("child", {}).get("depth", 0) for ev in events]
     return {
@@ -134,9 +177,9 @@ def main():
     if not run_dir.is_dir():
         raise SystemExit(f"Run directory not found: {run_dir}")
 
-    db_paths = sorted(run_dir.rglob("state.db"))
+    db_paths = sorted(run_dir.rglob("state.sqlite"))
     if not db_paths:
-        raise SystemExit("No state.db files found.")
+        raise SystemExit("No state.sqlite files found.")
 
     all_events: list[dict] = []
     for db_path in db_paths:
@@ -155,11 +198,16 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    print(f"\n=== Mechanism Report ===")
+    print("\n=== Mechanism Report ===")
     print(f"Databases: {report['n_databases']}  Steps: {report['n_events']}")
     pir = report["pir"]
     print(f"\nPIR: {pir.get('pir_count')}/{pir.get('nontrivial_decisions')} "
           f"({100 * pir['pir']:.1f}%)" if pir.get("pir") is not None else "\nPIR: N/A")
+    if pir.get("cost_intervention_rate") is not None:
+        print(f"Cost-only interventions: {100 * pir['cost_intervention_rate']:.1f}%")
+        print(f"Progress-only interventions: {100 * pir['progress_intervention_rate']:.1f}%")
+    if pir.get("budget_filter_rate") is not None:
+        print(f"Budget-feasibility filtering: {100 * pir['budget_filter_rate']:.1f}%")
     cal = report["calibration"]
     if cal:
         print(f"\nEstimator  MAE={cal['mae']:.1f}  median_AE={cal['median_abs_error']:.1f}  "

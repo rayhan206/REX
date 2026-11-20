@@ -6,9 +6,11 @@ from dataclasses import asdict
 import numpy as np
 
 from .backends.base import RejectedBeforeInference
-from .budgets import CostEstimator, adaptive_output_limit, affordable_arms, charge
-from .config import Config
-from .policies import advance, counterfactual_baseline_choice, new_arm, observe, observe_improvement, select
+from .budgets import (CostEstimator, FrozenLinearCostPredictor, adaptive_output_limit,
+                      affordable_arms, charge, request_cost_features)
+from .config import BUDGETED_METHODS, Config
+from .policies import (advance, counterfactual_baseline_choice, counterfactual_component_choices,
+                       new_arm, observe, observe_improvement, select)
 from .prompts import admissible, extract_code, prepare
 from .store import Store
 from .types import (EvaluationResult, GenerationRequest, Message, RepairTask, SearchCheckpoint,
@@ -55,12 +57,14 @@ def run_trial(store: Store, task: RepairTask, job: dict, config: Config, backend
                 break
             campaign_check()
             estimator = CostEstimator(**state.estimator)
+            frozen_predictor = FrozenLinearCostPredictor.from_config(config.cost_model)
             prompts, estimates, cases = {}, {}, {}
+            cost_features = {}
 
             # For budgeted_rex, exclude policy-deduplicated arms when the flag is set.
             # Generation accounting is unaffected: duplicates are still charged.
             policy_arm_ids: set[str] | None = None
-            if method == "budgeted_rex" and config.policy.deduplicate_policy_arms:
+            if method in BUDGETED_METHODS and config.policy.deduplicate_policy_arms:
                 # Keep only the canonical arm per code hash (earliest) and arms
                 # with no code yet (root, or not yet generated).
                 seen_code: dict[str, str] = {}
@@ -76,7 +80,7 @@ def run_trial(store: Store, task: RepairTask, job: dict, config: Config, backend
                 # For budgeted_rex with invalid_arm_actionable=False, skip arms
                 # whose only generated code produced invalid completions and have
                 # never produced a parseable code hash.
-                if (method == "budgeted_rex"
+                if (method in BUDGETED_METHODS
                         and not config.policy.invalid_arm_actionable
                         and arm.code_hash is None
                         and arm.arm_id != "root"
@@ -89,12 +93,24 @@ def run_trial(store: Store, task: RepairTask, job: dict, config: Config, backend
                 prompt, failure_id = prepare(task, arm, arm_code, seed, state.iteration)
                 if admissible(prompt, config.model.context_tokens, config.model.max_output_tokens):
                     prompts[arm.arm_id], cases[arm.arm_id] = prompt, failure_id
-                    estimates[arm.arm_id] = estimator.estimate(prompt)
+                    if method in BUDGETED_METHODS:
+                        features = request_cost_features(
+                            prompt=prompt,
+                            candidate_code=arm_code,
+                            depth=arm.depth,
+                            kind="generation" if arm.arm_id == "root" else "repair",
+                            prior_output_tokens=estimator.output_tokens,
+                        )
+                        cost_features[arm.arm_id] = features
+                        estimates[arm.arm_id] = frozen_predictor.predict(features)
+                    else:
+                        # Preserve the archived estimator exactly for all baseline methods.
+                        estimates[arm.arm_id] = estimator.estimate(prompt)
 
             # Budgeted REx: apply the per-trial token budget soft cap before selection.
             budget_active_estimates = estimates
             remaining_tokens: int | None = None
-            if method == "budgeted_rex" and config.budgets.per_trial_token_cap is not None:
+            if method in BUDGETED_METHODS and config.budgets.per_trial_token_cap is not None:
                 spent = state.ledger.tokens
                 if spent is not None:
                     remaining_tokens = config.budgets.per_trial_token_cap - spent
@@ -117,8 +133,14 @@ def run_trial(store: Store, task: RepairTask, job: dict, config: Config, backend
 
             # Budgeted REx: optionally tighten the output limit to fit remaining budget.
             output_limit = config.model.max_output_tokens
-            if method == "budgeted_rex" and remaining_tokens is not None:
-                predicted_input = estimator.estimate(prompt) - estimator.output_tokens
+            if method in BUDGETED_METHODS and remaining_tokens is not None:
+                # The frozen predictor estimates total request cost.  Its frozen
+                # output reserve is removed to obtain the input-side allowance.
+                predicted_input = max(
+                    1.0,
+                    frozen_predictor.predict(cost_features[parent_id])
+                    - frozen_predictor.output_reserve,
+                )
                 tighter = adaptive_output_limit(
                     remaining_tokens,
                     predicted_input,
@@ -141,18 +163,29 @@ def run_trial(store: Store, task: RepairTask, job: dict, config: Config, backend
 
             # Mechanism diagnostics for budgeted_rex: record counterfactual baseline choice.
             mechanism: dict = {}
-            if method == "budgeted_rex":
+            if method in BUDGETED_METHODS:
                 eligible_arms = [a for a in state.arms if a.arm_id in budget_active_estimates]
                 base_choice = counterfactual_baseline_choice(
                     eligible_arms, budget_active_estimates, decision.get("draws", {})
                 )
+                component_choices = counterfactual_component_choices(
+                    eligible_arms, budget_active_estimates, decision.get("draws", {}), config.policy
+                )
                 mechanism = {
                     "baseline_choice": base_choice,
+                    "progress_only_choice": component_choices["progress_only"],
+                    "cost_only_choice": component_choices["cost_only"],
                     "extension_choice": parent_id,
                     "policy_changed_choice": parent_id != base_choice,
+                    "progress_changed_choice": component_choices["progress_only"] != base_choice,
+                    "cost_changed_choice": component_choices["cost_only"] != base_choice,
                     "eligible_count": len(eligible_arms),
+                    "budget_filtered_count": len(estimates) - len(budget_active_estimates),
                     "remaining_tokens": remaining_tokens,
                     "output_limit_used": output_limit,
+                    "cost_estimator": "frozen_linear_v1",
+                    "cost_model_hash": config.cost_model.coefficients_hash,
+                    "extension_method": method,
                 }
 
             context = {
@@ -282,7 +315,7 @@ def run_trial(store: Store, task: RepairTask, job: dict, config: Config, backend
 
         # budgeted_rex: apply separate progress posterior update and track branch stats.
         progress_delta: float = 0.0
-        if method == "budgeted_rex" and not terminal:
+        if method in BUDGETED_METHODS and not terminal:
             progress_delta = observe_improvement(parent, child)
             parent.generated_token_sum += (result.input_tokens or 0) + (result.output_tokens or 0)
             if code is None:
@@ -293,11 +326,11 @@ def run_trial(store: Store, task: RepairTask, job: dict, config: Config, backend
 
         # Track duplicate generations for budgeted_rex branch-quality stats.
         duplicate = code_hash is not None and any(a.code_hash == code_hash for a in state.arms[:-1])
-        if method == "budgeted_rex" and duplicate:
+        if method in BUDGETED_METHODS and duplicate:
             parent.duplicate_count += 1
 
         # Update code-to-arm index used by policy deduplication.
-        if method == "budgeted_rex" and code_hash is not None and code_hash not in state.code_to_arm_id:
+        if method in BUDGETED_METHODS and code_hash is not None and code_hash not in state.code_to_arm_id:
             state.code_to_arm_id[code_hash] = child.arm_id
 
         best = next((a for a in state.arms if a.arm_id == state.best_id), None)

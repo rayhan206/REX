@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "description": "Frozen non-negative linear cost model fitted on archived development-only traces. Do not refit on held-out tasks.",
+  "root_intercept": 0.0,
+  "repair_intercept": 0.0,
+  "prompt_char_coef": 0.2519338037231654,
+  "candidate_char_coef": 0.43970017956754104,
+  "depth_coef": 0.0,
+  "error_feedback_coef": 0.0,
+  "output_reserve": 182.41666666666666,
+  "fit_mae_tokens": 80.3951337389499,
+  "fit_mape_pct": 11.860183470095473,
+  "fit_n_requests": 108,
+  "fit_source": "development_only",
+  "fit_methods": [
+    "resample",
+    "rex",
+    "rex_progress_cost"
+  ],
+  "feature_definition": "request_cost_features_v1",
+  "fit_databases": [
+    "viva_complete_pilot/state.sqlite"
+  ]
+}

@@ -9,12 +9,12 @@ Usage::
 
 The script reads all SQLite databases under ``--run-dir`` for the methods
 specified in ``--methods`` (default: all), extracts per-request features and
-actual token counts, fits a simple OLS linear model with separate intercepts
+actual token counts, fits a non-negative linear model with separate intercepts
 for generation and repair requests, then writes the frozen coefficients to
 ``--out`` as JSON.
 
-The resulting JSON file is consumed by ``configs/budgeted_rex_dev_v1.yaml``
-via ``cost_model.coefficients_file``.  After fitting, copy the
+The resulting JSON file is consumed by a development configuration via
+``cost_model.coefficients_file``.  After fitting, copy the
 ``coefficients_hash`` printed to stdout into that YAML field to enable hash
 validation on load.
 
@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sqlite3
 from pathlib import Path
 
 try:
@@ -33,65 +32,66 @@ try:
 except ImportError:
     raise SystemExit("numpy is required: uv pip install numpy")
 
+from rexbench.budgets import request_cost_features
+from rexbench.store import Store
 from rexbench.util import fingerprint
 
 
-def _iter_requests(db_path: Path) -> list[dict]:
+def _iter_requests(db_path: Path, methods: set[str] | None = None) -> list[dict]:
     """Yield per-request feature rows from a trial SQLite database."""
-    con = sqlite3.connect(str(db_path))
-    con.row_factory = sqlite3.Row
+    store = Store(db_path.parent, readonly=True)
     rows = []
     try:
-        # Join requests with their stored context blobs.
-        for row in con.execute(
-            "SELECT r.id, r.state, r.request_blob, r.context_blob, r.response_blob "
-            "FROM requests r WHERE r.state = 'committed'"
+        for row in store.db.execute(
+            "SELECT r.id, r.request_blob, r.context_blob, g.result_blob, "
+            "p.method FROM requests r "
+            "JOIN generations g ON g.request_id=r.id "
+            "JOIN planned_trials p ON p.id=r.trial_id "
+            "WHERE r.state='committed'"
         ):
-            import json as _json
-            req_blob = con.execute(
-                "SELECT value FROM blobs WHERE id=?", (row["request_blob"],)
-            ).fetchone()
-            ctx_blob = con.execute(
-                "SELECT value FROM blobs WHERE id=?", (row["context_blob"],)
-            ).fetchone()
-            if req_blob is None or ctx_blob is None:
+            if methods is not None and row["method"] not in methods:
                 continue
-            req = _json.loads(req_blob["value"])
-            ctx = _json.loads(ctx_blob["value"])
-            # Look up actual token usage from the generation result.
-            if row["response_blob"]:
-                res_blob = con.execute(
-                    "SELECT value FROM blobs WHERE id=?", (row["response_blob"],)
-                ).fetchone()
-                if res_blob:
-                    res = _json.loads(res_blob["value"])
-                    input_tokens = res.get("input_tokens")
-                    output_tokens = res.get("output_tokens")
-                    if input_tokens is not None and output_tokens is not None:
-                        prompt: str = ctx.get("prompt", "")
-                        parent_id: str = ctx.get("parent_id", "root")
-                        # Candidate code length from the prompt (heuristic: everything
-                        # after the last "```python" header is candidate code).
-                        candidate_chars = 0
-                        if "```python" in prompt:
-                            candidate_chars = len(prompt.split("```python")[-1])
-                        rows.append({
-                            "kind": req.get("kind", "generation"),
-                            "prompt_chars": len(prompt),
-                            "candidate_chars": candidate_chars,
-                            "depth": 0 if parent_id == "root" else 1,
-                            "feedback_chars": 0,
-                            "input_tokens": int(input_tokens),
-                            "output_tokens": int(output_tokens),
-                            "total_tokens": int(input_tokens) + int(output_tokens),
-                        })
+            req = store.object(row["request_blob"])
+            ctx = store.object(row["context_blob"])
+            result = store.object(row["result_blob"])
+            input_tokens = result.get("input_tokens")
+            output_tokens = result.get("output_tokens")
+            if input_tokens is None or output_tokens is None:
+                continue
+            parent_id = ctx.get("parent_id", "root")
+            arm_row = store.db.execute(
+                "SELECT state FROM arms WHERE trial_id=(SELECT trial_id FROM requests WHERE id=?) "
+                "AND arm_id=?", (row["id"], parent_id)
+            ).fetchone()
+            arm = json.loads(arm_row["state"]) if arm_row else {}
+            candidate_code = ""
+            if arm.get("code_hash"):
+                candidate_code = store.get(arm["code_hash"]).decode("utf-8", errors="replace")
+            features = request_cost_features(
+                prompt=ctx.get("prompt", ""),
+                candidate_code=candidate_code,
+                depth=int(arm.get("depth", 0)),
+                kind=req.get("kind", "generation"),
+                prior_output_tokens=0.0,
+            )
+            rows.append({
+                "method": row["method"],
+                "kind": features.kind,
+                "prompt_chars": features.prompt_chars,
+                "candidate_chars": features.candidate_chars,
+                "depth": features.depth,
+                "feedback_chars": features.feedback_chars,
+                "input_tokens": int(input_tokens),
+                "output_tokens": int(output_tokens),
+                "total_tokens": int(input_tokens) + int(output_tokens),
+            })
     finally:
-        con.close()
+        store.close()
     return rows
 
 
 def fit(rows: list[dict]) -> dict:
-    """Fit OLS on request features → total tokens, separate intercepts."""
+    """Fit non-negative least squares on request features → total tokens."""
     if not rows:
         raise ValueError("No committed requests found; nothing to fit.")
 
@@ -120,18 +120,37 @@ def fit(rows: list[dict]) -> dict:
     X_arr = np.array(X, dtype=float)
     y_arr = np.array(y, dtype=float)
 
-    # OLS: (X^T X)^{-1} X^T y
-    try:
-        coeffs, _residuals, _rank, _sv = np.linalg.lstsq(X_arr, y_arr, rcond=None)
-    except np.linalg.LinAlgError as exc:
-        raise ValueError(f"OLS failed: {exc}") from exc
-
-    root_intercept = float(max(0.0, coeffs[0]))
-    repair_intercept = float(max(0.0, coeffs[1]))
-    prompt_char_coef = float(max(0.0, coeffs[2]))
-    candidate_char_coef = float(max(0.0, coeffs[3]))
-    depth_coef = float(max(0.0, coeffs[4]))
-    error_feedback_coef = float(max(0.0, coeffs[5]))
+    # Cyclic coordinate descent for non-negative least squares.  A plain OLS
+    # fit followed by clipping is not NNLS and produced badly miscalibrated
+    # coefficients in the original implementation.
+    scales = np.linalg.norm(X_arr, axis=0)
+    scales[scales == 0.0] = 1.0
+    design = X_arr / scales
+    coeffs_scaled = np.zeros(design.shape[1], dtype=float)
+    prediction = design @ coeffs_scaled
+    for _ in range(10_000):
+        largest_change = 0.0
+        for column in range(design.shape[1]):
+            values = design[:, column]
+            denominator = float(values @ values)
+            if denominator == 0.0:
+                continue
+            residual_without_column = y_arr - prediction + values * coeffs_scaled[column]
+            updated = max(0.0, float(values @ residual_without_column) / denominator)
+            change = updated - coeffs_scaled[column]
+            if change:
+                prediction += values * change
+                coeffs_scaled[column] = updated
+                largest_change = max(largest_change, abs(change))
+        if largest_change < 1e-9:
+            break
+    coeffs = coeffs_scaled / scales
+    root_intercept = float(coeffs[0])
+    repair_intercept = float(coeffs[1])
+    prompt_char_coef = float(coeffs[2])
+    candidate_char_coef = float(coeffs[3])
+    depth_coef = float(coeffs[4])
+    error_feedback_coef = float(coeffs[5])
     output_reserve = float(max(0.0, output_mean))
 
     # Evaluation metrics.
@@ -173,14 +192,15 @@ def main():
     if not run_dir.is_dir():
         raise SystemExit(f"Run directory not found: {run_dir}")
 
-    # Collect all state.db files under run_dir.
-    db_paths = sorted(run_dir.rglob("state.db"))
+    # Each run uses one append-only state.sqlite plus content-addressed artifacts.
+    db_paths = sorted(run_dir.rglob("state.sqlite"))
     if not db_paths:
-        raise SystemExit(f"No state.db files found under {run_dir}")
+        raise SystemExit(f"No state.sqlite files found under {run_dir}")
 
     all_rows: list[dict] = []
+    methods = set(args.methods) if args.methods else None
     for db_path in db_paths:
-        all_rows.extend(_iter_requests(db_path))
+        all_rows.extend(_iter_requests(db_path, methods))
 
     print(f"Collected {len(all_rows)} committed requests from {len(db_paths)} databases.")
 
@@ -188,6 +208,9 @@ def main():
         raise SystemExit("No committed requests with token usage found.")
 
     coefficients = fit(all_rows)
+    coefficients["fit_methods"] = sorted({row["method"] for row in all_rows})
+    coefficients["feature_definition"] = "request_cost_features_v1"
+    coefficients["fit_databases"] = [f"{path.parent.name}/{path.name}" for path in db_paths]
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -197,7 +220,7 @@ def main():
     print(f"Written to {out_path}")
     print(f"MAE: {coefficients['fit_mae_tokens']:.2f} tokens")
     print(f"MAPE: {coefficients['fit_mape_pct']:.2f}%")
-    print(f"\ncoefficients_hash (paste into budgeted_rex_dev_v1.yaml):\n  {h}")
+    print(f"\ncoefficients_hash (paste into the matching development config):\n  {h}")
 
 
 if __name__ == "__main__":

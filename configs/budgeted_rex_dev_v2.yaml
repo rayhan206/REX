@@ -1,0 +1,103 @@
+schema_version: 1
+# Development-only protocol. This is a new plan; v1 and archived baselines are
+# intentionally left untouched. Values are starting points from the research plan,
+# not evidence that budgeted_rex is superior.
+experiment:
+  name: apps_budgeted_rex_dev_v2
+  track: controlled_extension
+  # Explicit REx plus matched budget control and component ablations.
+  methods:
+    - rex
+    - budgeted_rex_control
+    - budgeted_rex_progress
+    - budgeted_rex_cost
+    - budgeted_rex
+  seeds: [0, 1, 2]
+  primary_comparison: budgeted_rex_vs_budgeted_rex_control
+  primary_metric: hidden_success_at_primary_token_budget
+
+data:
+  raw_train: data/raw_development_test_mirror/test
+  raw_test: data/unavailable_final
+  development_source_partition: test
+  dev_count: 5
+  evaluation_count: 0
+  difficulty: [interview]
+  split_seed: 2026
+  min_repair_tests: 3
+  min_hidden_tests: 5
+  max_repair_tests: 10
+  repair_target_tests: 3
+  max_hidden_tests: 5
+  require_audit: true
+  repair_file: data/development_pilot/dev_repair.jsonl
+  manifest: data/development_pilot/manifest.json
+  source_url: https://datasets-server.huggingface.co/rows?dataset=codeparrot%2Fapps&config=all&split=test&offset=100&length=100
+  source_revision: rows-sha256:b931a2ea3ee0e5d574d9c08f230ab7b2266978a2dd24acef85162ec2179c6644;repo:21e74ddf8de1a21436da12e3e653065c5213e9d1
+  license: MIT per codeparrot/apps dataset card; retain original problem-source attribution
+  audit_only_references: data/audit_private/references.jsonl
+  manual_audit: docs/development_manual_audit.json
+
+model:
+  backend: ollama
+  endpoint: http://localhost:11434
+  name: qwen2.5-coder:7b
+  digest: null
+  temperature: 1.0
+  max_output_tokens: 2048
+  context_tokens: 16384
+  request_timeout_seconds: 900.0
+
+policy:
+  # Lower prior concentration lets measured branch evidence matter sooner.
+  C: 5.0
+  eta: 0.5
+  gamma: 1.0
+  progress_weight: 0.5
+  initial_expected_delta: 0.1
+  deduplicate_policy_arms: true
+  invalid_arm_actionable: false
+
+cost_model:
+  coefficients_file: cost_model_dev_v2.json
+  coefficients_hash: d4d51c62547404cddae20753237d2abe6254a8dd11f4a1f98430a416eda7749a
+
+judge:
+  backend: docker
+  image: rexbench-runner:local
+  image_digest: null
+  evaluation_cache: false
+  memory_mib: 256
+  cpus: 1.0
+  pids_limit: 32
+  tmp_mib: 16
+  cpu_seconds: 2
+  program_wall_seconds: 5.0
+  startup_seconds: 30.0
+  stdout_bytes: 65536
+  stderr_bytes: 16384
+
+budgets:
+  # 8192 is approximately the archived pilot's empirical 90th percentile.
+  call_checkpoints: [1, 2, 4, 8, 16]
+  token_checkpoints: [1024, 2048, 4096, 8192]
+  coverage_extension_call_ceiling: 32
+  per_trial_token_cap: 8192
+  token_safety_margin: 64
+  minimum_output_tokens: 128
+  allow_budget_overshoot: true
+  token_reserve_quantile: 0.90
+  max_dispatched_calls: 1400
+  campaign_wall_hours: 8.0
+
+execution:
+  workers: 1
+  model_concurrency: 1
+  resume: true
+  require_exact_usage_for_cost_report: true
+
+report:
+  bootstrap_samples: 10000
+  bootstrap_seed: 2026
+  require_complete_matrix: true
+  emit_formats: [csv, json, png, svg, html]

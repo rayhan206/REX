@@ -22,7 +22,7 @@ from rexbench.budgets import (
     adaptive_output_limit,
     affordable_arms,
 )
-from rexbench.config import METHODS, Budgets, Config, FrozenCostModel, Policy
+from rexbench.config import EXTENSIONS, METHODS, Budgets, Config, FrozenCostModel, Policy
 from rexbench.policies import (
     counterfactual_baseline_choice,
     new_arm,
@@ -173,6 +173,24 @@ class TestZeroExtensionEquivalence:
             ch_rex, _ = select("rex", arms, estimates, left, cfg, {})
             ch_bud, _ = select("budgeted_rex", arms, estimates, right, cfg, {})
             assert ch_rex == ch_bud
+
+    def test_budgeted_control_matches_rex_under_same_eligibility_and_draws(self):
+        cfg = Policy(C=5, progress_weight=1, gamma=1)
+        arms = _arms([0.2, 0.5, 0.8], C=5)
+        estimates = {"root": 100.0, "a1": 500.0, "a2": 2000.0, "a3": 50.0}
+        for seed in range(50):
+            left, right = _rng(seed), _rng(seed)
+            rex, _ = select("rex", arms, estimates, left, cfg, {})
+            control, _ = select("budgeted_rex_control", arms, estimates, right, cfg, {})
+            assert rex == control
+            assert left.bit_generator.state == right.bit_generator.state
+
+    def test_matched_ablation_weights(self):
+        cfg = Policy(progress_weight=0.75, gamma=1.0)
+        assert cfg.budgeted_weights("budgeted_rex_control") == (0.0, 0.0)
+        assert cfg.budgeted_weights("budgeted_rex_progress") == (0.75, 0.0)
+        assert cfg.budgeted_weights("budgeted_rex_cost") == (0.0, 1.0)
+        assert cfg.budgeted_weights("budgeted_rex") == (0.75, 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +474,6 @@ class TestCounterfactualBaselineChoice:
 
 class TestConfigNewFields:
     def test_budgeted_rex_in_methods(self):
-        from rexbench.config import METHODS, EXTENSIONS
         assert "budgeted_rex" in METHODS
         assert "budgeted_rex" in EXTENSIONS
 

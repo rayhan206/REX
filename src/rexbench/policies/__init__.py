@@ -25,7 +25,7 @@ from typing import Any
 
 import numpy as np
 
-from ..config import Policy
+from ..config import BUDGETED_METHODS, Policy
 from ..types import ArmState
 
 
@@ -122,8 +122,11 @@ def select(
             cursor = policy_state.get("cursor", 0)
             chosen = endpoints[cursor % cfg.fixed_width]
 
-    elif method == "budgeted_rex":
-        chosen, scores, draws = _select_budgeted_rex(eligible, estimates, rng, cfg)
+    elif method in BUDGETED_METHODS:
+        progress_weight, gamma = cfg.budgeted_weights(method)
+        chosen, scores, draws = _select_budgeted_rex(
+            eligible, estimates, rng, cfg, progress_weight, gamma
+        )
 
     else:
         # Archived methods: resample / rex / rex_progress / rex_cost / rex_progress_cost.
@@ -150,6 +153,8 @@ def _select_budgeted_rex(
     estimates: dict[str, float],
     rng: np.random.Generator,
     cfg: Policy,
+    progress_weight: float | None = None,
+    gamma: float | None = None,
 ) -> tuple[str, dict[str, float], dict[str, float]]:
     """Core budgeted_rex scoring logic.
 
@@ -171,6 +176,8 @@ def _select_budgeted_rex(
     selection given the same rng state.
     """
     min_est = min(estimates[a.arm_id] for a in eligible)
+    progress_weight = cfg.progress_weight if progress_weight is None else progress_weight
+    gamma = cfg.gamma if gamma is None else gamma
 
     draws: dict[str, float] = {}
     scores: dict[str, float] = {}
@@ -188,10 +195,10 @@ def _select_budgeted_rex(
         headroom = max(0.0, 1.0 - a.h)
         expected_progress = p_improve * min(headroom, mean_delta)
 
-        utility = base_draw + cfg.progress_weight * expected_progress
+        utility = base_draw + progress_weight * expected_progress
 
         relative_cost = estimates[a.arm_id] / max(1.0, min_est)
-        score = utility / max(1e-9, relative_cost ** cfg.gamma)
+        score = utility / max(1e-9, relative_cost ** gamma)
 
         scores[a.arm_id] = score
 
@@ -233,3 +240,38 @@ def counterfactual_baseline_choice(
     """
     scores = {a.arm_id: base_draws[a.arm_id] for a in eligible if a.arm_id in base_draws}
     return max(scores, key=lambda x: scores[x]) if scores else ""
+
+
+def counterfactual_component_choices(
+    eligible: list[ArmState],
+    estimates: dict[str, float],
+    base_draws: dict[str, float],
+    cfg: Policy,
+) -> dict[str, str]:
+    """Isolate progress-only and cost-only interventions under identical draws."""
+    if not eligible or not base_draws:
+        return {"baseline": "", "progress_only": "", "cost_only": ""}
+    min_est = min(estimates[a.arm_id] for a in eligible)
+    baseline_scores: dict[str, float] = {}
+    progress_scores: dict[str, float] = {}
+    cost_scores: dict[str, float] = {}
+    for arm in eligible:
+        if arm.arm_id not in base_draws:
+            continue
+        draw = base_draws[arm.arm_id]
+        baseline_scores[arm.arm_id] = draw
+        p_improve = arm.improve_alpha / (arm.improve_alpha + arm.improve_beta)
+        mean_delta = (
+            arm.improvement_sum / arm.expansion_count
+            if arm.expansion_count > 0
+            else cfg.initial_expected_delta
+        )
+        expected_progress = p_improve * min(max(0.0, 1.0 - arm.h), mean_delta)
+        progress_scores[arm.arm_id] = draw + cfg.progress_weight * expected_progress
+        relative_cost = estimates[arm.arm_id] / max(1.0, min_est)
+        cost_scores[arm.arm_id] = draw / max(1e-9, relative_cost ** cfg.gamma)
+    return {
+        "baseline": max(baseline_scores, key=baseline_scores.get),
+        "progress_only": max(progress_scores, key=progress_scores.get),
+        "cost_only": max(cost_scores, key=cost_scores.get),
+    }

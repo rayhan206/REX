@@ -12,7 +12,13 @@ from .types import Limits, Record
 from .util import fingerprint
 
 CORE = ["resample", "greedy", "rex", "rex_progress", "rex_cost", "rex_progress_cost"]
-EXTENSIONS = ["budgeted_rex"]
+BUDGETED_METHODS = [
+    "budgeted_rex_control",
+    "budgeted_rex_progress",
+    "budgeted_rex_cost",
+    "budgeted_rex",
+]
+EXTENSIONS = BUDGETED_METHODS.copy()
 METHODS = CORE + EXTENSIONS + ["bfs", "fixed_width"]
 
 
@@ -115,6 +121,16 @@ class Policy(Record):
             raise ValueError("Unknown method")
         return (self.eta if method in ("rex_progress", "rex_progress_cost") else 0.,
                 self.gamma if method in ("rex_cost", "rex_progress_cost") else 0.)
+
+    def budgeted_weights(self, method: str) -> tuple[float, float]:
+        """Return progress and cost weights for the matched v2 ablations."""
+        if method not in BUDGETED_METHODS:
+            raise ValueError("Not a budgeted method")
+        progress_weight = self.progress_weight if method in (
+            "budgeted_rex_progress", "budgeted_rex"
+        ) else 0.0
+        gamma = self.gamma if method in ("budgeted_rex_cost", "budgeted_rex") else 0.0
+        return progress_weight, gamma
 
 
 class Judge(Limits):

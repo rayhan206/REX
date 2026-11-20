@@ -32,6 +32,40 @@ class CostFeatures:
     prior_output_tokens: float  # current estimator output EWMA
 
 
+def request_cost_features(
+    prompt: str,
+    candidate_code: str,
+    depth: int,
+    kind: str,
+    prior_output_tokens: float,
+) -> CostFeatures:
+    """Extract the frozen predictor inputs used during fitting and search.
+
+    ``feedback_chars`` is measured from the stable repair-prompt markers.  Keeping
+    this extraction in one place prevents the fitted model and the live selector
+    from silently using different feature definitions.
+    """
+    marker = "One failed repair test:\n"
+    end_marker = "\n\nFix the program"
+    feedback_chars = 0
+    if marker in prompt:
+        feedback = prompt.split(marker, 1)[1]
+        feedback = feedback.split(end_marker, 1)[0]
+        feedback_chars = len(feedback)
+    # Candidate and feedback text also appear inside the full prompt.  Remove
+    # them from the structural prompt feature so the three length features do
+    # not double-count the same characters during fitting or prediction.
+    structural_prompt_chars = max(0, len(prompt) - len(candidate_code) - feedback_chars)
+    return CostFeatures(
+        kind=kind,
+        prompt_chars=structural_prompt_chars,
+        candidate_chars=len(candidate_code),
+        depth=depth,
+        feedback_chars=feedback_chars,
+        prior_output_tokens=prior_output_tokens,
+    )
+
+
 @dataclass(frozen=True)
 class FrozenLinearCostPredictor:
     """Development-fitted frozen linear cost model.
