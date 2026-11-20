@@ -271,7 +271,7 @@ def counterfactual_component_choices(
         relative_cost = estimates[arm.arm_id] / max(1.0, min_est)
         cost_scores[arm.arm_id] = draw / max(1e-9, relative_cost ** cfg.gamma)
     return {
-        "baseline": max(baseline_scores, key=baseline_scores.get),
-        "progress_only": max(progress_scores, key=progress_scores.get),
-        "cost_only": max(cost_scores, key=cost_scores.get),
+        "baseline": max(baseline_scores, key=lambda arm_id: baseline_scores[arm_id]),
+        "progress_only": max(progress_scores, key=lambda arm_id: progress_scores[arm_id]),
+        "cost_only": max(cost_scores, key=lambda arm_id: cost_scores[arm_id]),
     }
